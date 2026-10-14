@@ -221,6 +221,8 @@ def main():
 
             cv2.putText(frame, f"Gesture: {stable_gesture}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, "Press 'q' to quit", (10, height - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.imshow("Gesture Detector", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
