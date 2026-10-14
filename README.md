@@ -3,6 +3,11 @@
 Real-time hand gesture recognition from your webcam, built with [MediaPipe Hands](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) and OpenCV.
 Every time a gesture is recognized, the app shows its name on screen and plays a sound.
 
+> [!NOTE]
+> This is a hobby project. Recognition is based on simple geometric rules, so you may run into
+> bugs or detection errors (missed or wrong gestures), especially with poor lighting or unusual hand angles.
+> Issues and pull requests are welcome!
+
 ## Supported gestures
 
 | Gesture | Emoji | How to do it | Sound |
