@@ -1,235 +1,237 @@
+import math
+import os
+import sys
+import time
+
 import cv2
 import mediapipe as mp
 import pygame
-import time
-import sys
 
-# --- Pygame Mixer Initialization for Sounds ---
-pygame.mixer.init()
+# --- Configuration ---
+SOUND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+CAMERA_INDEX = 0          # 0 = default webcam
+STABLE_FRAMES = 5         # frames a gesture must persist before it is accepted
+PLAY_COOLDOWN = 1.0       # seconds between two sounds
 
-# Path to your sounds directory (adjust if necessary)
-SOUND_DIR = "suoni/"
-
-# Load sounds
-try:
-    sound_like = pygame.mixer.Sound(SOUND_DIR + "like.wav")
-    sound_dislike = pygame.mixer.Sound(SOUND_DIR + "dislike.wav")
-    sound_vittoria = pygame.mixer.Sound(SOUND_DIR + "vittoria.wav")
-    sound_dito_medio = pygame.mixer.Sound(SOUND_DIR + "dito_medio.wav")
-    sound_rock = pygame.mixer.Sound(SOUND_DIR + "rock.wav")
-    sound_chiamami = pygame.mixer.Sound(SOUND_DIR + "chiamami.wav")
-    sound_bang_bang = pygame.mixer.Sound(SOUND_DIR + "bang_bang.wav")
-except pygame.error as e:
-    print(f"Errore nel caricamento dei suoni: {e}")
-    print("Assicurati che i file .wav siano nella cartella 'suoni' e che i nomi siano corretti.")
-    # Assign None to sounds if loading fails to prevent errors later
-    sound_like = sound_dislike = sound_vittoria = sound_dito_medio = None
-    sound_rock = sound_chiamami = sound_bang_bang = None
-
-# Store references to sounds in a dictionary for easy access
-GESTURE_SOUNDS = {
-    "LIKE": sound_like,
-    "DISLIKE": sound_dislike,
-    "VITTORIA": sound_vittoria,
-    "DITO_MEDIO": sound_dito_medio,
-    "ROCK": sound_rock,
-    "CHIAMAMI": sound_chiamami,
-    "BANG_BANG": sound_bang_bang
+GESTURE_SOUND_FILES = {
+    "LIKE": "like.wav",
+    "DISLIKE": "dislike.wav",
+    "VICTORY": "victory.wav",
+    "MIDDLE_FINGER": "middle_finger.wav",
+    "ROCK": "rock.wav",
+    "CALL_ME": "call_me.wav",
+    "BANG_BANG": "bang_bang.wav",
 }
 
-# --- MediaPipe Setup ---
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,  # We'll focus on one hand for simplicity
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.5
-)
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
+HL = mp_hands.HandLandmark
 
-# --- Gesture Recognition Logic ---
-# These functions define what constitutes each gesture based on landmark positions
-# NO LONGER NEED get_hand_info, passing 'landmarks' directly from MediaPipe
+# Landmark indices for the four fingers: (MCP, PIP, TIP)
+FINGERS = {
+    "index": (HL.INDEX_FINGER_MCP, HL.INDEX_FINGER_PIP, HL.INDEX_FINGER_TIP),
+    "middle": (HL.MIDDLE_FINGER_MCP, HL.MIDDLE_FINGER_PIP, HL.MIDDLE_FINGER_TIP),
+    "ring": (HL.RING_FINGER_MCP, HL.RING_FINGER_PIP, HL.RING_FINGER_TIP),
+    "pinky": (HL.PINKY_MCP, HL.PINKY_PIP, HL.PINKY_TIP),
+}
 
-def is_thumb_up(landmarks):
-    """Gesture: Thumbs Up (LIKE)"""
-    # Thumb tip is above index finger tip and thumb is extended
-    # We use .y for vertical position (smaller Y is higher) and .x for horizontal position
-    if (landmarks[mp_hands.HandLandmark.THUMB_TIP].y < landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP].y and
-        landmarks[mp_hands.HandLandmark.THUMB_IP].x < landmarks[mp_hands.HandLandmark.THUMB_MCP].x): # Check thumb extension on X-axis (for right hand - adjust for left if needed)
-        return True
-    return False
+# Finger patterns: (thumb, index, middle, ring, pinky). None = "don't care".
+# LIKE / DISLIKE share a pattern and are told apart by the thumb direction.
+GESTURE_PATTERNS = [
+    ("VICTORY",       (None,  True,  True,  False, False)),
+    ("MIDDLE_FINGER", (None,  False, True,  False, False)),
+    ("ROCK",          (None,  True,  False, False, True)),
+    ("CALL_ME",       (True,  False, False, False, True)),
+    ("BANG_BANG",     (True,  True,  False, False, False)),
+    ("THUMB",         (True,  False, False, False, False)),
+]
 
-def is_thumb_down(landmarks):
-    """Gesture: Thumbs Down (DISLIKE)"""
-    # Thumb tip is below pinky tip and thumb is extended
-    if (landmarks[mp_hands.HandLandmark.THUMB_TIP].y > landmarks[mp_hands.HandLandmark.PINKY_TIP].y and
-        landmarks[mp_hands.HandLandmark.THUMB_IP].x < landmarks[mp_hands.HandLandmark.THUMB_MCP].x): # Check thumb extension on X-axis (for right hand)
-        return True
-    return False
 
-def is_victory_sign(landmarks):
-    """Gesture: Victory/Peace (V)"""
-    # Index and middle fingers are up, others down
-    index_up = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP].y < landmarks[mp_hands.HandLandmark.INDEX_FINGER_PIP].y
-    middle_up = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y < landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y
-    ring_down = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.RING_FINGER_PIP].y
-    pinky_down = landmarks[mp_hands.HandLandmark.PINKY_TIP].y > landmarks[mp_hands.HandLandmark.PINKY_PIP].y
-    # Simple check for thumb: not extended up like a thumbs up
-    thumb_crossed_or_bent = landmarks[mp_hands.HandLandmark.THUMB_TIP].x > landmarks[mp_hands.HandLandmark.INDEX_FINGER_MCP].x or \
-                            landmarks[mp_hands.HandLandmark.THUMB_TIP].y > landmarks[mp_hands.HandLandmark.THUMB_IP].y
+# --- Gesture Recognition ---
+# Landmarks are normalized to [0, 1] on both axes, so x is rescaled by the
+# frame aspect ratio to get distances that are not distorted.
+# All checks are distance/direction based, so they work with either hand and
+# with the hand rotated (e.g. the sideways "bang bang" pose).
 
-    return index_up and middle_up and ring_down and pinky_down and thumb_crossed_or_bent
+def to_points(landmarks, aspect_ratio):
+    return [(lm.x * aspect_ratio, lm.y) for lm in landmarks]
 
-def is_middle_finger(landmarks):
-    """Gesture: Middle Finger"""
-    # Only middle finger is up
-    index_down = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.INDEX_FINGER_PIP].y
-    middle_up = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y < landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y
-    ring_down = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.RING_FINGER_PIP].y
-    pinky_down = landmarks[mp_hands.HandLandmark.PINKY_TIP].y > landmarks[mp_hands.HandLandmark.PINKY_PIP].y
-    # Thumb usually tucked away or not pointing up
-    thumb_bent = landmarks[mp_hands.HandLandmark.THUMB_TIP].x > landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_MCP].x or \
-                 landmarks[mp_hands.HandLandmark.THUMB_TIP].y > landmarks[mp_hands.HandLandmark.THUMB_IP].y
 
-    return index_down and middle_up and ring_down and pinky_down and thumb_bent
+def dist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
-def is_rock_n_roll(landmarks):
-    """Gesture: Rock and Roll (🤘)"""
-    # Index and pinky up, middle and ring down, thumb might be bent
-    index_up = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP].y < landmarks[mp_hands.HandLandmark.INDEX_FINGER_PIP].y
-    middle_down = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y
-    ring_down = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.RING_FINGER_PIP].y
-    pinky_up = landmarks[mp_hands.HandLandmark.PINKY_TIP].y < landmarks[mp_hands.HandLandmark.PINKY_PIP].y
-    
-    # Thumb often tucked under, or slightly out, but not pointing up significantly
-    thumb_not_up = landmarks[mp_hands.HandLandmark.THUMB_TIP].y > landmarks[mp_hands.HandLandmark.THUMB_IP].y
 
-    return index_up and middle_down and ring_down and pinky_up and thumb_not_up
+def is_finger_extended(points, finger):
+    """A finger is extended when its tip is farther from the wrist than its PIP joint
+    and the finger is roughly straight."""
+    mcp, pip, tip = (points[i] for i in FINGERS[finger])
+    wrist = points[HL.WRIST]
+    return dist(wrist, tip) > dist(wrist, pip) * 1.1 and dist(mcp, tip) > dist(mcp, pip) * 1.5
 
-def is_call_me(landmarks):
-    """Gesture: Call Me (🤙)"""
-    # Thumb and pinky up, middle and ring down, index might be bent
-    thumb_up = landmarks[mp_hands.HandLandmark.THUMB_TIP].y < landmarks[mp_hands.HandLandmark.THUMB_IP].y
-    index_down_or_bent = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.INDEX_FINGER_PIP].y
-    middle_down = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y
-    ring_down = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.RING_FINGER_PIP].y
-    pinky_up = landmarks[mp_hands.HandLandmark.PINKY_TIP].y < landmarks[mp_hands.HandLandmark.PINKY_PIP].y
-    
-    return thumb_up and index_down_or_bent and middle_down and ring_down and pinky_up
 
-def is_bang_bang(landmarks):
-    """Gesture: Bang Bang (Gun gesture)"""
-    # Index and thumb extended, other fingers curled
-    index_up = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP].y < landmarks[mp_hands.HandLandmark.INDEX_FINGER_PIP].y
-    # Thumb extended horizontally (adjust condition based on hand orientation)
-    # This might need fine-tuning depending on the angle you hold your hand
-    thumb_extended_horizontally = abs(landmarks[mp_hands.HandLandmark.THUMB_TIP].x - landmarks[mp_hands.HandLandmark.THUMB_IP].x) > \
-                                  abs(landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP].x - landmarks[mp_hands.HandLandmark.INDEX_FINGER_PIP].x) * 0.5 # Example, check horizontal extension
-    
-    # Ensure other fingers are curled
-    middle_down = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y
-    ring_down = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP].y > landmarks[mp_hands.HandLandmark.RING_FINGER_PIP].y
-    pinky_down = landmarks[mp_hands.HandLandmark.PINKY_TIP].y > landmarks[mp_hands.HandLandmark.PINKY_PIP].y
+def angle_between(v1, v2):
+    """Angle in degrees between two 2D vectors."""
+    norm = math.hypot(*v1) * math.hypot(*v2)
+    if norm == 0:
+        return 0.0
+    cos = (v1[0] * v2[0] + v1[1] * v2[1]) / norm
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos))))
 
-    return index_up and thumb_extended_horizontally and middle_down and ring_down and pinky_down
 
-def detect_gesture(hand_landmarks_obj): # Removed image_width, image_height as they're not needed for landmark attribute access
-    """Detects the specific gesture based on hand landmarks."""
-    landmarks = hand_landmarks_obj.landmark # Access the landmark data directly
+def is_thumb_extended(points):
+    """The thumb is extended when it is roughly straight and its tip sticks out
+    away from the palm (instead of being folded over the fingers)."""
+    mcp, ip, tip = points[HL.THUMB_MCP], points[HL.THUMB_IP], points[HL.THUMB_TIP]
+    index_mcp, pinky_mcp = points[HL.INDEX_FINGER_MCP], points[HL.PINKY_MCP]
+    palm_size = dist(points[HL.WRIST], points[HL.MIDDLE_FINGER_MCP])
+    bend = angle_between((ip[0] - mcp[0], ip[1] - mcp[1]), (tip[0] - ip[0], tip[1] - ip[1]))
+    return (bend < 40
+            and dist(tip, pinky_mcp) > dist(ip, pinky_mcp)
+            and dist(tip, index_mcp) > palm_size * 0.3)
 
-    if is_thumb_up(landmarks):
-        return "LIKE"
-    elif is_thumb_down(landmarks):
-        return "DISLIKE"
-    elif is_victory_sign(landmarks):
-        return "VITTORIA"
-    elif is_middle_finger(landmarks):
-        return "DITO_MEDIO"
-    elif is_rock_n_roll(landmarks):
-        return "ROCK"
-    elif is_call_me(landmarks):
-        return "CHIAMAMI"
-    elif is_bang_bang(landmarks):
-        return "BANG_BANG"
-    
+
+def thumb_direction(points):
+    """Returns 'UP', 'DOWN' or None depending on where the thumb is pointing."""
+    mcp, tip = points[HL.THUMB_MCP], points[HL.THUMB_TIP]
+    dx, dy = tip[0] - mcp[0], tip[1] - mcp[1]
+    if abs(dy) < abs(dx) * 1.2:  # thumb is mostly horizontal
+        return None
+    return "UP" if dy < 0 else "DOWN"  # image y grows downwards
+
+
+def finger_states(points):
+    return (
+        is_thumb_extended(points),
+        is_finger_extended(points, "index"),
+        is_finger_extended(points, "middle"),
+        is_finger_extended(points, "ring"),
+        is_finger_extended(points, "pinky"),
+    )
+
+
+def matches(states, pattern):
+    return all(p is None or p == s for s, p in zip(states, pattern))
+
+
+def detect_gesture(hand_landmarks, aspect_ratio):
+    """Detects the gesture made by a single hand. Returns a gesture name or 'NONE'."""
+    points = to_points(hand_landmarks.landmark, aspect_ratio)
+    states = finger_states(points)
+
+    for name, pattern in GESTURE_PATTERNS:
+        if matches(states, pattern):
+            if name == "THUMB":
+                direction = thumb_direction(points)
+                if direction == "UP":
+                    return "LIKE"
+                if direction == "DOWN":
+                    return "DISLIKE"
+                return "NONE"
+            return name
     return "NONE"
 
-# --- Main Program Loop ---
-cap = cv2.VideoCapture(0) # 0 for default webcam
 
-if not cap.isOpened():
-    print("Errore: Impossibile accedere alla webcam. Assicurati che non sia già in uso e che i driver siano installati.")
-    sys.exit()
+# --- Sounds ---
 
-# Variables to manage sound playback frequency
-last_played_gesture = "NONE"
-last_play_time = time.time()
-PLAY_COOLDOWN = 1.0 # seconds, to prevent rapid sound re-triggers
+def load_sounds():
+    sounds = {}
+    for gesture, filename in GESTURE_SOUND_FILES.items():
+        path = os.path.join(SOUND_DIR, filename)
+        try:
+            sounds[gesture] = pygame.mixer.Sound(path)
+        except (pygame.error, FileNotFoundError) as e:
+            print(f"Could not load '{path}': {e}")
+    if len(sounds) < len(GESTURE_SOUND_FILES):
+        print("Some sounds are missing. Run 'python generate_sounds.py' to (re)create them.")
+    return sounds
 
-print("Detector di Gesture Avviato. Premi 'q' per uscire.")
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Errore: Impossibile leggere il frame dalla webcam.")
-        break
+# --- Main Loop ---
 
-    # Flip the frame horizontally for a mirror effect
-    frame = cv2.flip(frame, 1)
-    
-    # Convert the BGR image to RGB
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+def main():
+    pygame.mixer.init()
+    sounds = load_sounds()
 
-    # Process the frame with MediaPipe Hands
-    results = hands.process(rgb_frame)
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print("Error: cannot access the webcam. Make sure it is connected and not used by another app.")
+        sys.exit(1)
 
-    current_gesture = "NONE"
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.5,
+    )
 
-    # Draw hand landmarks and detect gestures
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp_hands.HAND_CONNECTIONS,
-                mp_drawing_styles.get_default_hand_landmarks_style(),
-                mp_drawing_styles.get_default_hand_connections_style()
-            )
-            
-            # Pass the hand_landmarks object directly
-            current_gesture = detect_gesture(hand_landmarks)
-            break # Process only the first detected hand for simplicity
+    candidate_gesture = "NONE"   # gesture seen in the latest frames
+    candidate_count = 0
+    stable_gesture = "NONE"      # gesture confirmed for STABLE_FRAMES frames
+    last_played_gesture = "NONE"
+    last_play_time = 0.0
 
-    # Play sound if a new gesture is detected and cooldown is over
-    if current_gesture != "NONE" and current_gesture != last_played_gesture and (time.time() - last_play_time > PLAY_COOLDOWN):
-        sound_to_play = GESTURE_SOUNDS.get(current_gesture)
-        if sound_to_play:
-            if not pygame.mixer.get_busy(): # Only play if mixer is not busy
-                sound_to_play.play()
-                print(f"Riconosciuta gesture: {current_gesture} - Riproduco {current_gesture.lower()}.wav")
-                last_played_gesture = current_gesture
+    print("Gesture Detector started. Press 'q' to quit.")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Error: cannot read a frame from the webcam.")
+                break
+
+            frame = cv2.flip(frame, 1)  # mirror effect
+            height, width = frame.shape[:2]
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb_frame)
+
+            current_gesture = "NONE"
+            if results.multi_hand_landmarks:
+                hand_landmarks = results.multi_hand_landmarks[0]
+                mp_drawing.draw_landmarks(
+                    frame,
+                    hand_landmarks,
+                    mp_hands.HAND_CONNECTIONS,
+                    mp_drawing_styles.get_default_hand_landmarks_style(),
+                    mp_drawing_styles.get_default_hand_connections_style(),
+                )
+                current_gesture = detect_gesture(hand_landmarks, width / height)
+
+            # Debounce: accept a gesture only after it persists for a few frames,
+            # so single-frame misdetections don't trigger sounds.
+            if current_gesture == candidate_gesture:
+                candidate_count += 1
+            else:
+                candidate_gesture = current_gesture
+                candidate_count = 1
+            if candidate_count >= STABLE_FRAMES:
+                stable_gesture = candidate_gesture
+
+            if stable_gesture == "NONE":
+                last_played_gesture = "NONE"
+            elif (stable_gesture != last_played_gesture
+                  and time.time() - last_play_time > PLAY_COOLDOWN):
+                sound = sounds.get(stable_gesture)
+                if sound:
+                    pygame.mixer.stop()
+                    sound.play()
+                print(f"Detected gesture: {stable_gesture}")
+                last_played_gesture = stable_gesture
                 last_play_time = time.time()
-        else:
-            print(f"Riconosciuta gesture: {current_gesture} - (Nessun suono associato o errore di caricamento)")
-    elif current_gesture == "NONE":
-        last_played_gesture = "NONE" # Reset for next detection
 
-    # Display the detected gesture on the frame
-    cv2.putText(frame, f"Gesture: {current_gesture}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, f"Gesture: {stable_gesture}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.imshow("Gesture Detector", frame)
 
-    # Display the frame
-    cv2.imshow('Gesture Detector', frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        hands.close()
+        cap.release()
+        cv2.destroyAllWindows()
+        pygame.mixer.quit()
+        pygame.quit()
 
-    # Exit on 'q' key press
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
 
-# --- Cleanup ---
-cap.release()
-cv2.destroyAllWindows()
-pygame.mixer.quit()
-pygame.quit()
-sys.exit()
+if __name__ == "__main__":
+    main()
